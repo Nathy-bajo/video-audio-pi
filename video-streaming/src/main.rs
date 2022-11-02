@@ -2,44 +2,53 @@
 
 use anyhow::Result;
 use base64::encode;
-use bus::{Bus, BusReader};
-// use futures_util::{SinkExt, StreamExt};
+use hound;
 use image::codecs;
-use image::ColorType;
 use image::ImageBuffer;
 use image::Rgb;
 use nokhwa::{Camera, CameraFormat, CaptureAPIBackend, FrameFormat};
 use rav1e::prelude::ChromaSampling;
 use rav1e::*;
 use rav1e::{config::SpeedSettings, prelude::FrameType};
+use rodio::{source::Source, OutputStream};
 use serde::{Deserialize, Serialize};
 use serde_json;
-use tokio::time::sleep;
+use std::i16;
 use std::str::FromStr;
-use std::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::Sender;
+use tokio_stream::StreamExt;
+// use std::sync::mpsc::{self, Receiver, Sender};
+use portaudio as pa;
+use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{env, thread};
 use tide::log::{debug, error, info, warn};
 use tide::Request;
 use tide_websockets::{Message, WebSocket, WebSocketConnection};
 use tokio::sync::watch;
-use std::io::BufWriter;
-// use portaudio as pa;
-
-
+use tokio::time::sleep;
 
 #[allow(non_snake_case)]
 #[derive(Serialize, Deserialize, Debug)]
 struct VideoPacket {
+    #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     frame_type: Option<String>,
-    epoch_time: Duration,
-    encoding: Encoder,
+    epoch_time: Option<Duration>,
+    encoding: Option<Encoder>,
+    packet_type: PacketType,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct SoundPacket {
+enum PacketType {
+    Audio,
+    Video,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SoundPacket {
     pub data: Vec<u8>,
 }
 
@@ -61,110 +70,18 @@ impl FromStr for Encoder {
     }
 }
 
-
 static THRESHOLD_MILLIS: u128 = 1000;
-
-
-// const SAMPLE_RATE: f64 = 44_100.0;
-// const FRAMES: u32 = 256;
-// const CHANNELS: i32 = 2;
-// const INTERLEAVED: bool = true;
-
-// fn run() -> Result<(), pa::Error> {
-//     let pa = pa::PortAudio::new()?;
-
-//     println!("PortAudio:");
-//     println!("version: {}", pa.version());
-//     println!("version text: {:?}", pa.version_text());
-//     println!("host count: {}", pa.host_api_count()?);
-
-//     let default_host = pa.default_host_api()?;
-//     println!("default host: {:#?}", pa.host_api_info(default_host));
-
-//     let def_input = pa.default_input_device()?;
-//     let input_info = pa.device_info(def_input)?;
-//     println!("Default input device info: {:#?}", &input_info);
-
-//     // Construct the input stream parameters.
-//     let latency = input_info.default_low_input_latency;
-//     let input_params = pa::StreamParameters::<f32>::new(def_input, CHANNELS, INTERLEAVED, latency);
-
-//     // let def_output = pa.default_output_device()?;
-//     // let output_info = pa.device_info(def_output)?;
-//     println!("Default output device info: {:#?}", &output_info);
-
-//     // Construct the output stream parameters.
-//     let latency = output_info.default_low_output_latency;
-//     // let output_params = pa::StreamParameters::new(def_output, CHANNELS, INTERLEAVED, latency);
-
-//     // Check that the stream format is supported.
-//     pa.is_duplex_format_supported(input_params, output_params, SAMPLE_RATE)?;
-
-//     // Construct the settings with which we'll open our duplex stream.
-//     let settings = pa::InputSettings::new(input_params, SAMPLE_RATE, FRAMES);
-
-//     // Once the countdown reaches 0 we'll close the stream.
-//     let mut count_down = 3.0;
-
-//     // Keep track of the last `current_time` so we can calculate the delta time.
-//     let mut maybe_last_time = None;
-
-//     // We'll use this channel to send the count_down to the main thread for fun.
-//     let (sender, receiver) = std::sync::mpsc::channel();
-
-//     // A callback to pass to the non-blocking stream.
-//     let callback = move |pa::InputCallbackArgs {
-//                              in_buffer,
-//                              out_buffer,
-//                              frames,
-//                              time,
-//                              ..
-//                          }| {
-//         let current_time = time.current;
-//         let prev_time = maybe_last_time.unwrap_or(current_time);
-//         let dt = current_time - prev_time;
-//         count_down -= dt;
-//         maybe_last_time = Some(current_time);
-
-//         assert!(frames == FRAMES as usize);
-//         sender.send(count_down).ok();
-
-//         // Pass the input straight to the output - BEWARE OF FEEDBACK!
-//         for (output_sample, input_sample) in out_buffer.iter_mut().zip(in_buffer.iter()) {
-//             *output_sample = *input_sample;
-//         }
-
-//         if count_down > 0.0 {
-//             pa::Continue
-//         } else {
-//             pa::Complete
-//         }
-//     };
-
-//     // Construct a stream with input and output sample types of f32.
-//     let mut stream = pa.open_non_blocking_stream(settings, callback)?;
-
-//     stream.start()?;
-
-//     // Loop while the non-blocking stream is active.
-//     while let true = stream.is_active()? {
-//         // Do some stuff!
-//         while let Ok(count_down) = receiver.try_recv() {
-//             println!("count_down: {:?}", count_down);
-//         }
-//     }
-
-//     stream.stop()?;
-
-//     Ok(())
-// }
+const SAMPLE_RATE: f64 = 44_100.0;
+const FRAMES: u32 = 256;
+const CHANNELS: i32 = 2;
+const INTERLEAVED: bool = true;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let (send_cam, recv_cam) = watch::channel(String::new());
 
     let state = TideState {
-        counter: Arc::new(Mutex::new(16)),
+        counter: Arc::new(Mutex::new(0_u16)),
     };
     let client_counter = state.counter.clone();
 
@@ -204,20 +121,18 @@ async fn main() -> Result<()> {
     enc.tiles = 4;
     enc.chroma_sampling = ChromaSampling::Cs444;
 
-    let (audio_send, audio_recv) = watch::channel(String::new());
-
-
-    // Add counter to warp so that we can access it when we add/remove connections
-
     let cfg = Config::new().with_encoder_config(enc).with_threads(4);
 
-    let (fps_tx, fps_rx): (Sender<u128>, Receiver<u128>) = mpsc::channel();
+    let (fps_tx, fps_rx): (
+        std::sync::mpsc::Sender<u128>,
+        std::sync::mpsc::Receiver<u128>,
+    ) = std::sync::mpsc::channel();
     let (cam_tx, cam_rx): (
-        Sender<(ImageBuffer<Rgb<u8>, Vec<u8>>, u128)>,
-        Receiver<(ImageBuffer<Rgb<u8>, Vec<u8>>, u128)>,
-    ) = mpsc::channel();
+        std::sync::mpsc::Sender<(ImageBuffer<Rgb<u8>, Vec<u8>>, u128)>,
+        std::sync::mpsc::Receiver<(ImageBuffer<Rgb<u8>, Vec<u8>>, u128)>,
+    ) = std::sync::mpsc::channel();
 
-    let devices = nokhwa::query_devices(CaptureAPIBackend::GStreamer)?;
+    let devices = nokhwa::query_devices(CaptureAPIBackend::Video4Linux)?;
     info!("available cameras: {:?}", devices);
 
     let fps_thread = tokio::spawn(async move {
@@ -241,6 +156,72 @@ async fn main() -> Result<()> {
             }
         }
     });
+    let (send_audio, recv_audio) = watch::channel(Vec::new());
+
+    let audio_thread = tokio::spawn(async move {
+        let pa = pa::PortAudio::new().unwrap();
+
+        println!("PortAudio:");
+        println!("version: {}", pa.version());
+        println!("version text: {:?}", pa.version_text());
+        println!("host count: {}", pa.host_api_count().unwrap());
+
+        let default_host = pa.default_host_api().unwrap();
+        println!("default host: {:#?}", pa.host_api_info(default_host));
+
+        let def_input = pa.default_input_device().unwrap();
+        let input_info = pa.device_info(def_input).unwrap();
+        println!("Default input device info: {:#?}", &input_info);
+
+        // Construct the input stream parameters.
+        let latency = input_info.default_low_input_latency;
+        let input_params =
+            pa::StreamParameters::<u8>::new(def_input, CHANNELS, INTERLEAVED, latency);
+        // Check that the stream format is supported.
+        pa.is_input_format_supported(input_params, SAMPLE_RATE)
+            .unwrap();
+
+        // Construct the settings with which we'll open our duplex stream.
+        let settings = pa::InputStreamSettings::new(input_params, SAMPLE_RATE, FRAMES);
+
+        // Keep track of the last `current_time` so we can calculate the delta time.
+        let mut maybe_last_time = None;
+
+        // We'll use this channel to send the count_down to the main thread for fun.
+        let (sender, receiver) = ::std::sync::mpsc::channel();
+
+        // A callback to pass to the non-blocking stream.
+        let callback = move |pa::InputStreamCallbackArgs {
+                                 buffer,
+                                 frames,
+                                 time,
+                                 ..
+                             }| {
+            let current_time = time.current;
+            let prev_time = maybe_last_time.unwrap_or(current_time);
+            let dt = current_time - prev_time;
+            maybe_last_time = Some(current_time);
+
+            assert!(frames == FRAMES as usize);
+            sender.send(buffer.to_vec()).unwrap();
+            pa::Continue
+        };
+
+        // Construct a stream with input and output sample types of f32.
+        let mut stream = pa.open_non_blocking_stream(settings, callback).unwrap();
+
+        stream.start().unwrap();
+
+        // Loop while the non-blocking stream is active.
+        while let true = stream.is_active().unwrap() {
+            // Do some stuff!
+            while let Ok(data) = receiver.try_recv() {
+                send_audio.send(data).unwrap();
+            }
+        }
+
+        stream.stop().unwrap();
+    });
 
     let camera_thread = tokio::spawn(async move {
         loop {
@@ -260,7 +241,7 @@ async fn main() -> Result<()> {
                     FrameFormat::MJPEG,
                     framerate,
                 )),
-                CaptureAPIBackend::GStreamer // format
+                CaptureAPIBackend::Video4Linux, // format
             )
             .unwrap();
             camera.open_stream().unwrap();
@@ -301,11 +282,12 @@ async fn main() -> Result<()> {
                     let frame = VideoPacket {
                         data: Some(encode(&buf)),
                         frame_type: None,
-                        epoch_time: since_the_epoch(),
-                        encoding: encoder.clone(),
+                        epoch_time: Some(since_the_epoch()),
+                        encoding: Some(encoder.clone()),
+                        packet_type: PacketType::Video,
                     };
                     let json = serde_json::to_string(&frame).unwrap();
-                    send_cam.send(json);
+                    send_cam.send(json).unwrap();
                     fps_tx_copy.send(since_the_epoch().as_millis()).unwrap();
                     continue;
                 }
@@ -355,11 +337,12 @@ async fn main() -> Result<()> {
                         let frame = VideoPacket {
                             data: Some(data),
                             frame_type: Some(frame_type.to_string()),
-                            epoch_time: since_the_epoch(),
-                            encoding: encoder.clone(),
+                            epoch_time: Some(since_the_epoch()),
+                            encoding: Some(encoder.clone()),
+                            packet_type: PacketType::Video,
                         };
                         let json = serde_json::to_string(&frame).unwrap();
-                        send_cam.send(json);
+                        send_cam.send(json).unwrap();
                         debug!("time serializing {:?}", time_serializing.elapsed());
                         fps_tx_copy.send(since_the_epoch().as_millis()).unwrap();
                     }
@@ -379,46 +362,93 @@ async fn main() -> Result<()> {
     });
 
     let mut app = tide::with_state(Arc::new(state));
-    let (playback_sender, playback_recv) = std::sync::mpsc::channel();
 
-    let play_back_thread = std::thread::spawn(move || {
+    let (playback_sender, mut playback_recv): (Sender<SoundPacket>, Receiver<SoundPacket>) =
+        tokio::sync::mpsc::channel(64);
+    let mut sender_clone = playback_sender.clone();
+
+    let play_back_thread = tokio::spawn(async move {
         //  create the rodio output stream
-        loop {
-           if let Ok(packet) =  playback_recv.recv() {
-            // convert packet.data to wav;
-            // decode and play on output stream
-           }
+        println!("castle");
+        let (_, stream_handle) = OutputStream::try_default().unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 44100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        println!("spec: {:?}", spec);
+
+        while let Some(packet) = playback_recv.recv().await {
+            let mut buffer = std::io::Cursor::new(Vec::new());
+            println!("killstreak");
+
+            let mut writer = hound::WavWriter::new(&mut buffer, spec.clone()).unwrap();
+            for sample in packet.data {
+                writer.write_sample(sample as i16).unwrap();
+            }
+            writer.finalize().unwrap();
+            let source = rodio::Decoder::new(buffer).unwrap();
+            println!("I am");
+            stream_handle.play_raw(source.convert_samples()).unwrap();
         }
     });
 
     app.at("/ws").get(WebSocket::new(
         move |req: Request<std::sync::Arc<TideState>>, wsc: WebSocketConnection| {
+            println!("something");
             let rx = WatchStream::new(recv_cam.clone());
+            let final_clone = sender_clone.clone();
+            let mut wsc_clone = wsc.clone();
+            let mut rx_audio = WatchStream::new(recv_audio.clone());
+            println!("anything");
+
+            tokio::spawn(async move {
+                while let Some(data) = rx_audio.next().await {
+                    let frame = VideoPacket {
+                        data: Some(encode(data)),
+                        frame_type: None,
+                        epoch_time: None,
+                        encoding: None,
+                        packet_type: PacketType::Audio,
+                    };
+                    let json = serde_json::to_string(&frame).unwrap();
+                    wsc_clone.send(Message::text(json)).await.unwrap();
+                    println!("rather");
+                }
+                // receive audio data
+            });
 
             async move {
                 println!("Web socketss {:?}", wsc);
                 let mut wsc_clone = wsc.clone();
 
                 tokio::spawn(async move {
-                    while let Some(Ok(Message::Text(msg))) = tokio_stream::StreamExt::next(&mut wsc_clone).await {
-                        if let Ok(packet) = serde_json::from_str::<SoundPacket>(&msg){
-                            // send sound packet to playback thread
-                            playback_sender.send(packet).unwrap();
+                    while let Some(res) = wsc_clone.next().await {
+                        println!("{res:?}");
+                        if let Ok(Message::Text(msg)) = res {
+                            if let Ok(packet) = serde_json::from_str::<SoundPacket>(&msg) {
+                                // send sound packet to playback thread
+                                println!("won");
+
+                                final_clone.send(packet).await.unwrap();
+                            }
                         }
                     }
                 });
-
+                println!("futa");
                 let _ = client_connection(wsc, req, rx).await?;
                 Ok(())
             }
         },
     ));
 
-    app.listen("0.0.0.0:8080").await?;
+    app.listen("0.0.0.0:8000").await?;
     encoder_thread.await.unwrap();
     fps_thread.await.unwrap();
     camera_thread.await.unwrap();
-    play_back_thread.join();
+    play_back_thread.await.unwrap();
+    audio_thread.await.unwrap();
     Ok(())
 }
 
@@ -442,7 +472,6 @@ pub struct TideState {
 
 use tokio_stream::wrappers::WatchStream;
 
-
 pub async fn client_connection(
     wsc: WebSocketConnection,
     request: Request<Arc<TideState>>,
@@ -458,8 +487,7 @@ pub async fn client_connection(
         info!("adding connection, connection counter: {:?}", *counter_ref);
         drop(counter_ref);
     }
-    loop {
-        let next = tokio_stream::StreamExt::next(&mut recv).await.unwrap();
+    while let Some(next) = recv.next().await {
         debug!("Forwarding video message");
         let time_serializing = Instant::now();
         match wsc.send(Message::text(next)).await {
