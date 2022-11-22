@@ -1,41 +1,28 @@
 // #[macro_use]
 
-// use anyhow::Result;
 use base64::encode;
-use hound;
+// use color_eyre::eyre::eyre;
+// use color_eyre::eyre::Result;
+use anyhow::Result;
 use image::codecs;
 use image::ImageBuffer;
 use image::Rgb;
 use nokhwa::{Camera, CameraFormat, CaptureAPIBackend, FrameFormat};
-// use rav1e::prelude::ChromaSampling;
-// use rav1e::*;
-// use rav1e::{config::SpeedSettings, prelude::FrameType};
-use color_eyre::eyre::eyre;
-use color_eyre::eyre::Result;
-use cpal::traits::DeviceTrait;
-use cpal::traits::HostTrait;
-use cpal::traits::StreamTrait;
 use portaudio as pa;
-use rodio::{source::Source, OutputStream};
+use rav1e::prelude::ChromaSampling;
+use rav1e::*;
+use rav1e::{config::SpeedSettings, prelude::FrameType};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::env;
 use std::i16;
 use std::str::FromStr;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use symphonia::core::codecs::CodecParameters;
-use symphonia::core::codecs::CODEC_TYPE_PCM_S16LE;
-use symphonia::core::units::TimeBase;
 use tide::log::{debug, error, info, warn};
 use tide::Request;
 use tide_websockets::{Message, WebSocket, WebSocketConnection};
 use tokio_stream::StreamExt;
-// use tokio::sync::watch;
-use tokio::time::sleep;
-
-mod audio;
 
 #[allow(non_snake_case)]
 #[derive(Serialize, Deserialize, Debug)]
@@ -78,10 +65,10 @@ impl FromStr for Encoder {
     }
 }
 
-// static THRESHOLD_MILLIS: u128 = 1000;
-const SAMPLE_RATE: f64 = 44_100.0;
-const FRAMES: u32 = 256;
-const CHANNELS: i32 = 1;
+static THRESHOLD_MILLIS: u128 = 1000;
+const SAMPLE_RATE: f64 = 48000.0;
+const FRAMES: u32 = 8000;
+// const FRAMES: u32 = 256;
 const INTERLEAVED: bool = true;
 
 #[tokio::main]
@@ -94,84 +81,79 @@ async fn main() -> Result<()> {
     let client_counter = state.counter.clone();
 
     env_logger::init();
-    // let mut enc = EncoderConfig::default();
-    // let width = 640;
-    // let height = 480;
-    // let video_device_index: usize = env::var("VIDEO_DEVICE_INDEX")
-    //     .ok()
-    //     .map(|n| n.parse::<usize>().ok())
-    //     .flatten()
-    //     .unwrap_or(0);
-    // let framerate: u32 = env::var("FRAMERATE")
-    //     .ok()
-    //     .map(|n| n.parse::<u32>().ok())
-    //     .flatten()
-    //     .unwrap_or(10u32);
-    // let encoder = env::var("ENCODER")
-    //     .ok()
-    //     .map(|o| Encoder::from_str(o.as_ref()).ok())
-    //     .flatten()
-    //     .unwrap_or(Encoder::AV1);
+    let mut enc = EncoderConfig::default();
+    let width = 640;
+    let height = 480;
+    let video_device_index: usize = env::var("VIDEO_DEVICE_INDEX")
+        .ok()
+        .map(|n| n.parse::<usize>().ok())
+        .flatten()
+        .unwrap_or(0);
+    let framerate: u32 = env::var("FRAMERATE")
+        .ok()
+        .map(|n| n.parse::<u32>().ok())
+        .flatten()
+        .unwrap_or(10u32);
+    let encoder = env::var("ENCODER")
+        .ok()
+        .map(|o| Encoder::from_str(o.as_ref()).ok())
+        .flatten()
+        .unwrap_or(Encoder::AV1);
 
-    // warn!("Framerate {framerate}");
-    // enc.width = width;
-    // enc.height = height;
-    // enc.bit_depth = 8;
-    // enc.error_resilient = true;
-    // enc.speed_settings = SpeedSettings::from_preset(10);
-    // enc.rdo_lookahead_frames = 1;
-    // enc.min_key_frame_interval = 20;
-    // enc.max_key_frame_interval = 50;
-    // enc.low_latency = true;
-    // enc.min_quantizer = 50;
-    // enc.quantizer = 100;
-    // enc.still_picture = false;
-    // enc.tiles = 4;
-    // enc.chroma_sampling = ChromaSampling::Cs444;
+    warn!("Framerate {framerate}");
+    enc.width = width;
+    enc.height = height;
+    enc.bit_depth = 8;
+    enc.error_resilient = true;
+    enc.speed_settings = SpeedSettings::from_preset(10);
+    enc.rdo_lookahead_frames = 1;
+    enc.min_key_frame_interval = 20;
+    enc.max_key_frame_interval = 50;
+    enc.low_latency = true;
+    enc.min_quantizer = 50;
+    enc.quantizer = 100;
+    enc.still_picture = false;
+    enc.tiles = 4;
+    enc.chroma_sampling = ChromaSampling::Cs444;
 
-    // let cfg = Config::new().with_encoder_config(enc).with_threads(4);
+    let cfg = Config::new().with_encoder_config(enc).with_threads(4);
 
-    // let (fps_tx, fps_rx): (
-    //     std::sync::mpsc::Sender<u128>,
-    //     std::sync::mpsc::Receiver<u128>,
-    // ) = std::sync::mpsc::channel();
-    // let (cam_tx, cam_rx): (
-    //     std::sync::mpsc::Sender<(ImageBuffer<Rgb<u8>, Vec<u8>>, u128)>,
-    //     std::sync::mpsc::Receiver<(ImageBuffer<Rgb<u8>, Vec<u8>>, u128)>,
-    // ) = std::sync::mpsc::channel();
+    let (fps_tx, fps_rx): (
+        std::sync::mpsc::Sender<u128>,
+        std::sync::mpsc::Receiver<u128>,
+    ) = std::sync::mpsc::channel();
+    let (cam_tx, cam_rx): (
+        std::sync::mpsc::Sender<(ImageBuffer<Rgb<u8>, Vec<u8>>, u128)>,
+        std::sync::mpsc::Receiver<(ImageBuffer<Rgb<u8>, Vec<u8>>, u128)>,
+    ) = std::sync::mpsc::channel();
 
-    // let devices = nokhwa::query_devices(CaptureAPIBackend::Video4Linux)?;
-    // info!("available cameras: {:?}", devices);
+    let devices = nokhwa::query_devices(CaptureAPIBackend::Video4Linux)?;
+    info!("available cameras: {:?}", devices);
 
-    // let fps_thread = tokio::spawn(async move {
-    //     let mut num_frames = 0;
-    //     let mut now_plus_1 = since_the_epoch().as_millis() + 1000;
-    //     warn!("Starting fps loop");
-    //     loop {
-    //         match fps_rx.recv() {
-    //             Ok(dur) => {
-    //                 if now_plus_1 < dur {
-    //                     warn!("FPS: {:?}", num_frames);
-    //                     num_frames = 0;
-    //                     now_plus_1 = since_the_epoch().as_millis() + 1000;
-    //                 } else {
-    //                     num_frames += 1;
-    //                 }
-    //             }
-    //             Err(e) => {
-    //                 error!("Receive error: {:?}", e);
-    //             }
-    //         }
-    //     }
-    // });
+    let fps_thread = tokio::spawn(async move {
+        let mut num_frames = 0;
+        let mut now_plus_1 = since_the_epoch().as_millis() + 1000;
+        warn!("Starting fps loop");
+        loop {
+            match fps_rx.recv() {
+                Ok(dur) => {
+                    if now_plus_1 < dur {
+                        warn!("FPS: {:?}", num_frames);
+                        num_frames = 0;
+                        now_plus_1 = since_the_epoch().as_millis() + 1000;
+                    } else {
+                        num_frames += 1;
+                    }
+                }
+                Err(e) => {
+                    error!("Receive error: {:?}", e);
+                }
+            }
+        }
+    });
     let (send_audio, recv_audio) = tokio::sync::watch::channel(Vec::new());
 
-    // let sound_thread = std::thread::spawn(move || {
-    //     let clip = AudioClip::record(send_audio).unwrap();
-    //     println!("clip: {:?}", clip);
-    // });
-
-    let audio_thread = tokio::spawn(async move {
+    let audio_thread = std::thread::spawn(move || {
         let pa = pa::PortAudio::new().unwrap();
 
         println!("PortAudio:");
@@ -187,195 +169,184 @@ async fn main() -> Result<()> {
         println!("Default input device info: {:#?}", &input_info);
 
         // Construct the input stream parameters.
-        let latency = input_info.default_low_input_latency;
+        let latency = input_info.default_high_input_latency;
 
-        let input_params =
-            pa::StreamParameters::<u8>::new(def_input, CHANNELS, INTERLEAVED, latency);
+        let input_params = pa::StreamParameters::<i16>::new(def_input, 1, INTERLEAVED, latency);
+
         // Check that the stream format is supported.
         pa.is_input_format_supported(input_params, SAMPLE_RATE)
             .unwrap();
+
         // Construct the settings with which we'll open our input stream.
         let settings = pa::InputStreamSettings::new(input_params, SAMPLE_RATE, FRAMES);
-
-        // Keep track of the last `current_time` so we can calculate the delta time.
-        let mut maybe_last_time = None;
 
         // We'll use this channel to send the count_down to the main thread for fun.
         let (sender, receiver) = ::std::sync::mpsc::channel();
 
-        // A callback to pass to the non-blocking stream.
-        let callback = move |pa::InputStreamCallbackArgs {
-                                 buffer,
-                                 frames,
-                                 time,
-                                 ..
-                             }| {
-            let current_time = time.current;
-            let prev_time = maybe_last_time.unwrap_or(current_time);
-            let dt = current_time - prev_time;
-            maybe_last_time = Some(current_time);
+        let _handle = std::thread::spawn(move || {
+            // A callback to pass to the non-blocking stream.
+            let callback = move |pa::InputStreamCallbackArgs { buffer, frames, .. }| {
+                assert!(frames == FRAMES as usize);
+                sender.send(buffer.to_vec()).unwrap();
+                // println!("buffer: {:?}", buffer);
+                pa::Continue
+            };
 
-            assert!(frames == FRAMES as usize);
-            sender.send(buffer.to_vec()).unwrap();
-            println!("buffer: {:?}", buffer);
-            pa::Continue
-        };
-        // println!("callback: {:?}", callback);
+            // Construct a stream with input and output sample types of f32.
+            let mut stream = pa.open_non_blocking_stream(settings, callback).unwrap();
 
-        // Construct a stream with input and output sample types of f32.
-        let mut stream = pa.open_non_blocking_stream(settings, callback).unwrap();
+            stream.start().unwrap();
 
-        stream.start().unwrap();
+            // Loop while the non-blocking stream is active.
+            while let true = stream.is_active().unwrap() {}
 
-        // Loop while the non-blocking stream is active.
-        while let true = stream.is_active().unwrap() {
-            // Do some stuff!
-            while let Ok(data) = receiver.try_recv() {
+            stream.stop().unwrap();
+        });
+
+        loop {
+            if let Ok(data) = receiver.try_recv() {
                 send_audio.send(data).unwrap();
-                // println!("Data: {:?}", data);
             }
         }
-
-        stream.stop().unwrap();
     });
 
-    // let camera_thread = tokio::spawn(async move {
-    //     loop {
-    //         {
-    //             info!("waiting for browser...");
-    //             sleep(Duration::from_millis(200)).await;
-    //             let counter = client_counter.lock().unwrap();
-    //             if *counter <= 0 {
-    //                 continue;
-    //             }
-    //         }
-    //         let mut camera = Camera::with_backend(
-    //             video_device_index, // index
-    //             Some(CameraFormat::new_from(
-    //                 width as u32,
-    //                 height as u32,
-    //                 FrameFormat::MJPEG,
-    //                 framerate,
-    //             )),
-    //             CaptureAPIBackend::Video4Linux, // format
-    //         )
-    //         .unwrap();
-    //         camera.open_stream().unwrap();
-    //         loop {
-    //             {
-    //                 let counter = client_counter.lock().unwrap();
-    //                 if *counter <= 0 {
-    //                     break;
-    //                 }
-    //             }
-    //             let frame = camera.frame().unwrap();
-    //             cam_tx.send((frame, since_the_epoch().as_millis())).unwrap();
-    //         }
-    //     }
-    // });
+    let camera_thread = tokio::spawn(async move {
+        loop {
+            {
+                info!("waiting for browser...");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let counter = client_counter.lock().unwrap();
+                if *counter <= 0 {
+                    continue;
+                }
+            }
+            let mut camera = Camera::with_backend(
+                video_device_index, // index
+                Some(CameraFormat::new_from(
+                    width as u32,
+                    height as u32,
+                    FrameFormat::MJPEG,
+                    framerate,
+                )),
+                CaptureAPIBackend::Video4Linux, // format
+            )
+            .unwrap();
+            camera.open_stream().unwrap();
+            loop {
+                {
+                    let counter = client_counter.lock().unwrap();
+                    if *counter <= 0 {
+                        break;
+                    }
+                }
+                let frame = camera.frame().unwrap();
+                cam_tx.send((frame, since_the_epoch().as_millis())).unwrap();
+            }
+        }
+    });
 
-    // let encoder_thread = tokio::spawn(async move {
-    //     loop {
-    //         let fps_tx_copy = fps_tx.clone();
-    //         let mut ctx: Context<u8> = cfg.new_context().unwrap();
-    //         loop {
-    //             let (mut frame, age) = cam_rx.recv().unwrap();
-    //             // If age older than threshold, throw it away.
-    //             let frame_age = since_the_epoch().as_millis() - age;
-    //             debug!("frame age {}", frame_age);
-    //             if frame_age > THRESHOLD_MILLIS {
-    //                 debug!("throwing away old frame with age {} ms", frame_age);
-    //                 continue;
-    //             }
-    //             if encoder == Encoder::MJPEG {
-    //                 let mut buf: Vec<u8> = Vec::new();
-    //                 let mut jpeg_encoder =
-    //                     codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80);
-    //                 jpeg_encoder
-    //                     .encode_image(&frame)
-    //                     .map_err(|e| error!("{:?}", e))
-    //                     .unwrap();
-    //                 let frame = Packet {
-    //                     data: Some(encode(&buf)),
-    //                     frame_type: None,
-    //                     epoch_time: Some(since_the_epoch()),
-    //                     encoding: Some(encoder.clone()),
-    //                     packet_type: PacketType::Video,
-    //                 };
-    //                 let json = serde_json::to_string(&frame).unwrap();
-    //                 send_cam.send(json).unwrap();
-    //                 fps_tx_copy.send(since_the_epoch().as_millis()).unwrap();
-    //                 continue;
-    //             }
-    //             let mut r_slice: Vec<u8> = vec![];
-    //             let mut g_slice: Vec<u8> = vec![];
-    //             let mut b_slice: Vec<u8> = vec![];
-    //             for pixel in frame.pixels_mut() {
-    //                 let (r, g, b) = to_ycbcr(pixel);
-    //                 r_slice.push(r);
-    //                 g_slice.push(g);
-    //                 b_slice.push(b);
-    //             }
-    //             let planes = vec![r_slice, g_slice, b_slice];
-    //             debug!("Creating new frame");
-    //             let mut frame = ctx.new_frame();
-    //             let encoding_time = Instant::now();
-    //             for (dst, src) in frame.planes.iter_mut().zip(planes) {
-    //                 dst.copy_from_raw_u8(&src, enc.width, 1);
-    //             }
+    let encoder_thread = tokio::spawn(async move {
+        loop {
+            let fps_tx_copy = fps_tx.clone();
+            let mut ctx: Context<u8> = cfg.new_context().unwrap();
+            loop {
+                let (mut frame, age) = cam_rx.recv().unwrap();
+                // If age older than threshold, throw it away.
+                let frame_age = since_the_epoch().as_millis() - age;
+                debug!("frame age {}", frame_age);
+                if frame_age > THRESHOLD_MILLIS {
+                    debug!("throwing away old frame with age {} ms", frame_age);
+                    continue;
+                }
+                if encoder == Encoder::MJPEG {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut jpeg_encoder =
+                        codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 80);
+                    jpeg_encoder
+                        .encode_image(&frame)
+                        .map_err(|e| error!("{:?}", e))
+                        .unwrap();
+                    let frame = Packet {
+                        data: Some(encode(&buf)),
+                        frame_type: None,
+                        epoch_time: Some(since_the_epoch()),
+                        encoding: Some(encoder.clone()),
+                        packet_type: PacketType::Video,
+                    };
+                    let json = serde_json::to_string(&frame).unwrap();
+                    send_cam.send(json).unwrap();
+                    fps_tx_copy.send(since_the_epoch().as_millis()).unwrap();
+                    continue;
+                }
+                let mut r_slice: Vec<u8> = vec![];
+                let mut g_slice: Vec<u8> = vec![];
+                let mut b_slice: Vec<u8> = vec![];
+                for pixel in frame.pixels_mut() {
+                    let (r, g, b) = to_ycbcr(pixel);
+                    r_slice.push(r);
+                    g_slice.push(g);
+                    b_slice.push(b);
+                }
+                let planes = vec![r_slice, g_slice, b_slice];
+                debug!("Creating new frame");
+                let mut frame = ctx.new_frame();
+                let encoding_time = Instant::now();
+                for (dst, src) in frame.planes.iter_mut().zip(planes) {
+                    dst.copy_from_raw_u8(&src, enc.width, 1);
+                }
 
-    //             match ctx.send_frame(frame) {
-    //                 Ok(_) => {
-    //                     debug!("queued frame");
-    //                 }
-    //                 Err(e) => match e {
-    //                     EncoderStatus::EnoughData => {
-    //                         debug!("Unable to append frame to the internal queue");
-    //                     }
-    //                     _ => {
-    //                         panic!("Unable to send frame");
-    //                     }
-    //                 },
-    //             }
-    //             debug!("receiving encoded frame");
-    //             match ctx.receive_packet() {
-    //                 Ok(pkt) => {
-    //                     debug!("time encoding {:?}", encoding_time.elapsed());
-    //                     debug!("read thread: base64 Encoding packet {}", pkt.input_frameno);
-    //                     let frame_type = if pkt.frame_type == FrameType::KEY {
-    //                         "key"
-    //                     } else {
-    //                         "delta"
-    //                     };
-    //                     let time_serializing = Instant::now();
-    //                     let data = encode(pkt.data);
-    //                     debug!("read thread: base64 Encoded packet {}", pkt.input_frameno);
-    //                     let frame = Packet {
-    //                         data: Some(data),
-    //                         frame_type: Some(frame_type.to_string()),
-    //                         epoch_time: Some(since_the_epoch()),
-    //                         encoding: Some(encoder.clone()),
-    //                         packet_type: PacketType::Video,
-    //                     };
-    //                     let json = serde_json::to_string(&frame).unwrap();
-    //                     send_cam.send(json).unwrap();
-    //                     debug!("time serializing {:?}", time_serializing.elapsed());
-    //                     fps_tx_copy.send(since_the_epoch().as_millis()).unwrap();
-    //                 }
-    //                 Err(e) => match e {
-    //                     EncoderStatus::LimitReached => {
-    //                         warn!("read thread: Limit reached");
-    //                     }
-    //                     EncoderStatus::Encoded => debug!("read thread: Encoded"),
-    //                     EncoderStatus::NeedMoreData => debug!("read thread: Need more data"),
-    //                     _ => {
-    //                         warn!("read thread: Unable to receive packet");
-    //                     }
-    //                 },
-    //             }
-    //         }
-    //     }
-    // });
+                match ctx.send_frame(frame) {
+                    Ok(_) => {
+                        debug!("queued frame");
+                    }
+                    Err(e) => match e {
+                        EncoderStatus::EnoughData => {
+                            debug!("Unable to append frame to the internal queue");
+                        }
+                        _ => {
+                            panic!("Unable to send frame");
+                        }
+                    },
+                }
+                debug!("receiving encoded frame");
+                match ctx.receive_packet() {
+                    Ok(pkt) => {
+                        debug!("time encoding {:?}", encoding_time.elapsed());
+                        debug!("read thread: base64 Encoding packet {}", pkt.input_frameno);
+                        let frame_type = if pkt.frame_type == FrameType::KEY {
+                            "key"
+                        } else {
+                            "delta"
+                        };
+                        let time_serializing = Instant::now();
+                        let data = encode(pkt.data);
+                        debug!("read thread: base64 Encoded packet {}", pkt.input_frameno);
+                        let frame = Packet {
+                            data: Some(data),
+                            frame_type: Some(frame_type.to_string()),
+                            epoch_time: Some(since_the_epoch()),
+                            encoding: Some(encoder.clone()),
+                            packet_type: PacketType::Video,
+                        };
+                        let json = serde_json::to_string(&frame).unwrap();
+                        send_cam.send(json).unwrap();
+                        debug!("time serializing {:?}", time_serializing.elapsed());
+                        fps_tx_copy.send(since_the_epoch().as_millis()).unwrap();
+                    }
+                    Err(e) => match e {
+                        EncoderStatus::LimitReached => {
+                            warn!("read thread: Limit reached");
+                        }
+                        EncoderStatus::Encoded => debug!("read thread: Encoded"),
+                        EncoderStatus::NeedMoreData => debug!("read thread: Need more data"),
+                        _ => {
+                            warn!("read thread: Unable to receive packet");
+                        }
+                    },
+                }
+            }
+        }
+    });
 
     let mut app = tide::with_state(Arc::new(state));
 
@@ -400,186 +371,92 @@ async fn main() -> Result<()> {
         println!("Default ouput device info: {:#?}", &output_info);
 
         // Construct the output stream parameters.
-        let latency = output_info.default_low_output_latency;
-        let output_params =
-            pa::StreamParameters::<u8>::new(def_output, CHANNELS, INTERLEAVED, latency);
+        let latency = output_info.default_high_output_latency;
+
+        let output_params = pa::StreamParameters::<i16>::new(def_output, 1, INTERLEAVED, latency);
+
         // Check that the stream format is supported.
-        pa.is_output_format_supported(output_params, SAMPLE_RATE)
+        pa.is_output_format_supported(output_params, 48000.0)
             .unwrap();
 
         // Construct the settings with which we'll open our output stream.
-        let settings = pa::OutputStreamSettings::<u8>::new(output_params, SAMPLE_RATE, FRAMES);
-
-        let mut count_down = 3.0;
-
-        // Keep track of the last `current_time` so we can calculate the delta time.
-        let mut maybe_last_time = None;
+        let settings = pa::OutputStreamSettings::new(output_params, 48000.0, FRAMES);
 
         // We'll use this channel to send the count_down to the main thread for fun.
         let (send_play, recv_play): (
-            std::sync::mpsc::Sender<Vec<u8>>,
-            std::sync::mpsc::Receiver<Vec<u8>>,
+            std::sync::mpsc::Sender<Vec<i16>>,
+            std::sync::mpsc::Receiver<Vec<i16>>,
         ) = std::sync::mpsc::channel();
 
         // A callback to pass to the non-blocking stream.
-        let callback = move |pa::OutputStreamCallbackArgs {
-                                 buffer,
-                                 frames,
-                                 time,
-                                 ..
-                             }| {
-            let current_time = time.current;
-            let prev_time = maybe_last_time.unwrap_or(current_time);
-            let dt = current_time - prev_time;
-            count_down -= dt;
-            maybe_last_time = Some(current_time);
+        let _handle = std::thread::spawn(move || {
+            let callback = move |pa::OutputStreamCallbackArgs { buffer, frames, .. }| {
+                assert!(frames == FRAMES as usize);
+                // println!("Output Buffer: {:?}", buffer);
 
-            assert!(frames == FRAMES as usize);
-            if let Ok(data) = recv_play.try_recv() {
-                // Pass the input straight to the output - BEWARE OF FEEDBACK!
-                for (output_sample, input_sample) in buffer.iter_mut().zip(data.iter()) {
-                    *output_sample = *input_sample;
+                if let Ok(data) = recv_play.try_recv() {
+                    // Pass the input straight to the output - BEWARE OF FEEDBACK!
+                    for (output_sample, input_sample) in buffer.iter_mut().zip(data.iter()) {
+                        *output_sample = *input_sample;
+                    }
                 }
-            }
-            pa::Continue
-        };
-        // Construct a stream with input and output sample types of f32.
-        let _ = std::thread::spawn(move || {
+                pa::Continue
+            };
+            // Construct a stream with input and output sample types of f32.
             let mut stream = pa.open_non_blocking_stream(settings, callback).unwrap();
-            stream
-                .start()
-                .map_err(|_e| {
-                    println!("The error? {}", _e);
-                    tide::http::Error::from_str(tide::StatusCode::BadRequest, "Error happened")
-                })
-                .unwrap();
+            stream.start().unwrap();
+            while let true = stream.is_active().unwrap() {}
+            stream.stop().unwrap()
         });
 
-        while let Some(packet) = playback_recv.recv().await {
-            println!("Audio processing");
-            // Do some stuff!
-            send_play
-                .send(packet.data)
-                .map_err(|_e| {
-                    println!("Audio failed because? {}", _e);
-                    tide::http::Error::from_str(tide::StatusCode::BadRequest, "Error happened")
-                })
-                .unwrap();
+        loop {
+            if let Some(packet) = playback_recv.recv().await {
+                println!("Audio processing");
+                let as_bytes: &[i16] = bytemuck::cast_slice(&packet.data);
+                let vec_of_bytes: Vec<i16> = as_bytes.to_vec();
+
+                // Do some stuff!
+                send_play
+                    .send(vec_of_bytes)
+                    .map_err(|_e| {
+                        println!("Audio failed because? {}", _e);
+                        tide::http::Error::from_str(
+                            tide::StatusCode::BadRequest,
+                            "Something happened shaa",
+                        )
+                    })
+                    .unwrap();
+            }
         }
     });
 
-    // let play_back_thread = tokio::spawn(async move {
-    //     println!("castle");
-    //     let spec = hound::WavSpec {
-    //         channels: 1,
-    //         sample_rate: 44100,
-    //         bits_per_sample: 16,
-    //         sample_format: hound::SampleFormat::Int,
-    //     };
-    //     println!("spec: {:?}", spec);
-
-    //     while let Some(packet) = playback_recv.recv().await {
-    //         println!("killstreak");
-
-    //         let clip = AudioClip::import(packet.data)
-    //             .map_err(|_e| {
-    //                 println!("The error? {}", _e);
-    //                 tide::http::Error::from_str(tide::StatusCode::BadRequest, "Error happened")
-    //             })
-    //             .unwrap();
-    //         println!("steaksss");
-
-    //         clip.play()
-    //             .map_err(|_e| {
-    //                 println!("The error?? {}", _e);
-    //                 tide::http::Error::from_str(tide::StatusCode::BadRequest, "Error happened")
-    //             })
-    //             .unwrap();
-
-    //         println!("atomic");
-    //     }
-    // });
-
-    // let play_back_thread = tokio::spawn(async move {
-    //     //  create the rodio output stream
-    //     println!("castle");
-    //     let (_, stream_handle) = OutputStream::try_default().unwrap();
-    //     let spec = hound::WavSpec {
-    //         channels: 1,
-    //         sample_rate: 44100,
-    //         bits_per_sample: 16,
-    //         sample_format: hound::SampleFormat::Int,
-    //     };
-    //     println!("spec: {:?}", spec);
-
-    //     while let Some(packet) = playback_recv.recv().await {
-    //         let mut buffer = std::io::Cursor::new(Vec::new());
-    //         println!("killstreak");
-
-    //         let mut writer = hound::WavWriter::new(&mut buffer, spec.clone()).unwrap();
-    //         for sample in packet.data {
-    //             writer.write_sample(sample as i16).unwrap();
-    //         }
-    //         writer.finalize().unwrap();
-    //         buffer.set_position(0);
-    //         let source = rodio::Decoder::new(buffer).unwrap();
-    //         println!("I am");
-    //         stream_handle.play_raw(source.convert_samples()).unwrap();
-    //         println!("did it work?");
-    //     }
-    // });
-
-    //     let play_thread = tokio::spawn(async move {
-    //         let mut params = CodecParameters::new();
-
-    //         params.for_codec(CODEC_TYPE_PCM_S16LE)
-    //     .with_channels(/* number of channels */)
-    //     .with_max_frames_per_packet(/* number of audio frames in a packet */)
-    //     .with_bits_per_coded_sample(16)
-    //     .with_bits_per_sample(16)
-    //     .with_sample_rate(44100)
-    //     .with_time_base(TimeBase::new(1, /* sample rate */));
-
-    //         let mut decoder = symphonia::default::get_codecs()
-    //             .make(&params, &Default::default())
-    //             .unwrap();
-
-    //             while let Some(packet) = playback_recv.recv().await {
-    //                 let packet = Packet::new_from_slice(0, /* timestamp (optional) */, /* duration (optional) */, /* audio data slice */);
-
-    // let audio = decoder.decode(&packet).unwrap();
-    //             }
-
-    //     });
-
-    use fon::chan::{Ch16, Ch32};
-    use fon::pos::Mono;
-    use fon::Audio;
-
     app.at("/ws").get(WebSocket::new(
         move |req: Request<std::sync::Arc<TideState>>, wsc: WebSocketConnection| {
-            println!("something");
             let rx = WatchStream::new(recv_cam.clone());
             let final_clone = sender_clone.clone();
             let wsc_clone = wsc.clone();
             let mut rx_audio = WatchStream::new(recv_audio.clone());
-            println!("anything");
-            //scale f32 to u8
             tokio::spawn(async move {
-                while let Some(data) = rx_audio.next().await {
-                    // let ints: Vec<u8> = data.iter().map(|x| *x as u8).collect();
-                    // println!("ints: {:?}", ints);
-                    let frame = Packet {
-                        data: Some(encode(data)),
-                        frame_type: None,
-                        epoch_time: None,
-                        encoding: None,
-                        packet_type: PacketType::Audio,
-                    };
-                    println!("frame: {:?}", frame);
-                    let json = serde_json::to_string(&frame).unwrap();
-                    wsc_clone.send(Message::text(json)).await.unwrap();
-                    println!("rather");
+                loop {
+                    if let Some(data) = rx_audio.next().await {
+                        let as_bytes: &[u8] = bytemuck::cast_slice(&data);
+                        //convert Vec<i16> to Vec<u8>
+                        let vec_of_bytes: Vec<u8> = as_bytes.to_vec();
+
+                        let frame = Packet {
+                            data: Some(encode(vec_of_bytes)),
+                            frame_type: None,
+                            epoch_time: None,
+                            encoding: None,
+                            packet_type: PacketType::Audio,
+                        };
+                        println!("frame: {:?}", frame);
+                        let json = serde_json::to_string(&frame).unwrap();
+                        wsc_clone.send(Message::text(json)).await.unwrap();
+                    } else {
+                        println!("Stream ended");
+                        break;
+                    }
                 }
                 // receive audio data
             });
@@ -609,28 +486,23 @@ async fn main() -> Result<()> {
                                 })
                             {
                                 // send sound packet to playback thread
-                                println!("won");
                                 final_clone.send(packet).await.unwrap();
-                                println!("won2");
                             }
                         }
                     }
                 });
-                println!("futa");
-                // let _ = client_connection(wsc, req, rx).await?;
+                let _ = client_connection(wsc, req, rx).await?;
                 Ok(())
             }
         },
     ));
 
     app.listen("0.0.0.0:8000").await?;
-    // encoder_thread.await.unwrap();
-    // fps_thread.await.unwrap();
-    // camera_thread.await.unwrap();
-    // play_back_thread.await.unwrap();
-    // sound_thread.join().unwrap();
+    encoder_thread.await.unwrap();
+    fps_thread.await.unwrap();
+    camera_thread.await.unwrap();
     player_thread.await.unwrap();
-    audio_thread.await.unwrap();
+    audio_thread.join().unwrap();
     Ok(())
 }
 
@@ -654,54 +526,43 @@ pub struct TideState {
 
 use tokio_stream::wrappers::WatchStream;
 
-use crate::audio::AudioClip;
+pub async fn client_connection(
+    wsc: WebSocketConnection,
+    request: Request<Arc<TideState>>,
+    mut recv: tokio_stream::wrappers::WatchStream<String>,
+) -> tide::Result {
+    let counter = &request.state().counter;
+    info!("establishing client connection... {:?}", wsc);
 
-// pub async fn client_connection(
-//     wsc: WebSocketConnection,
-//     request: Request<Arc<TideState>>,
-//     mut recv: tokio_stream::wrappers::WatchStream<String>,
-// ) -> tide::Result {
-//     let counter = &request.state().counter;
-//     info!("establishing client connection... {:?}", wsc);
-
-//     {
-//         info!("blocking before adding connection {:?}", counter);
-//         let mut counter_ref = counter.lock().unwrap();
-//         *counter_ref = *counter_ref + 1;
-//         info!("adding connection, connection counter: {:?}", *counter_ref);
-//         drop(counter_ref);
-//     }
-//     while let Some(next) = recv.next().await {
-//         debug!("Forwarding video message");
-//         let time_serializing = Instant::now();
-//         match wsc.send(Message::text(next)).await {
-//             Ok(_) => {}
-//             Err(_e) => {
-//                 info!("blocking before removing connection {:?}", counter);
-//                 let mut counter_ref = counter.lock().unwrap();
-//                 *counter_ref = *counter_ref - 1;
-//                 info!(
-//                     "Removing connection, connection counter: {:?}",
-//                     *counter_ref
-//                 );
-//                 break;
-//             }
-//         }
-//         debug!("web_socket serializing {:?}", time_serializing.elapsed());
-//     }
-
-//     Ok(format!("Action executed").into())
-// }
-
-// pub fn since_the_epoch() -> Duration {
-//     SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
-// }
-
-fn convert_to_bytes(buffer: Vec<u16>) -> Vec<u8> {
-    let mut pcm: Vec<u8> = Vec::new();
-
-    for frame in buffer {
-        pcm.extend(frame.to_le_bytes().iter());
+    {
+        info!("blocking before adding connection {:?}", counter);
+        let mut counter_ref = counter.lock().unwrap();
+        *counter_ref = *counter_ref + 1;
+        info!("adding connection, connection counter: {:?}", *counter_ref);
+        drop(counter_ref);
     }
-    pcm
+    while let Some(next) = recv.next().await {
+        debug!("Forwarding video message");
+        let time_serializing = Instant::now();
+        match wsc.send(Message::text(next)).await {
+            Ok(_) => {}
+            Err(_e) => {
+                info!("blocking before removing connection {:?}", counter);
+                let mut counter_ref = counter.lock().unwrap();
+                *counter_ref = *counter_ref - 1;
+                info!(
+                    "Removing connection, connection counter: {:?}",
+                    *counter_ref
+                );
+                break;
+            }
+        }
+        debug!("web_socket serializing {:?}", time_serializing.elapsed());
+    }
+
+    Ok(format!("Action executed").into())
+}
+
+pub fn since_the_epoch() -> Duration {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap()
 }
