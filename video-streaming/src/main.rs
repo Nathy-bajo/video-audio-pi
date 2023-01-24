@@ -26,7 +26,7 @@ use tokio_stream::StreamExt;
 
 #[allow(non_snake_case)]
 #[derive(Serialize, Deserialize, Debug)]
-struct Packet {
+pub struct Packet {
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,12 +68,11 @@ impl FromStr for Encoder {
 static THRESHOLD_MILLIS: u128 = 1000;
 const SAMPLE_RATE: f64 = 48000.0;
 const FRAMES: u32 = 8000;
-// const FRAMES: u32 = 256;
 const INTERLEAVED: bool = true;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (send_cam, recv_cam) = tokio::sync::watch::channel(String::new());
+    let (send_bytes, recv_bytes) = tokio::sync::watch::channel(String::new());
 
     let state = TideState {
         counter: Arc::new(Mutex::new(0_u16)),
@@ -126,9 +125,6 @@ async fn main() -> Result<()> {
         std::sync::mpsc::Sender<(ImageBuffer<Rgb<u8>, Vec<u8>>, u128)>,
         std::sync::mpsc::Receiver<(ImageBuffer<Rgb<u8>, Vec<u8>>, u128)>,
     ) = std::sync::mpsc::channel();
-
-    let devices = nokhwa::query_devices(CaptureAPIBackend::Video4Linux)?;
-    info!("available cameras: {:?}", devices);
 
     let fps_thread = tokio::spawn(async move {
         let mut num_frames = 0;
@@ -210,6 +206,34 @@ async fn main() -> Result<()> {
         }
     });
 
+    // let mut rx_audio = WatchStream::new(recv_audio.clone());
+
+    // loop {
+    //     if let Some(data) = rx_audio.next().await {
+    //         //convert Vec<i16> to Vec<u8>
+    //         let as_bytes: &[u8] = bytemuck::cast_slice(&data);
+    //         let vec_of_bytes: Vec<u8> = as_bytes.to_vec();
+
+    //         let frame = Packet {
+    //             data: Some(encode(vec_of_bytes)),
+    //             frame_type: None,
+    //             epoch_time: None,
+    //             encoding: None,
+    //             packet_type: PacketType::Audio,
+    //         };
+    //         println!("frame: {:?}", frame);
+    //         let json = serde_json::to_string(&frame).unwrap();
+    //         // send_bytes.send(json).unwrap();
+    //     } else {
+    //         println!("Stream ended");
+    //         break;
+    //     }
+    // }
+    //     // receive audio data
+
+    let devices = nokhwa::query_devices(CaptureAPIBackend::Video4Linux)?;
+    info!("available cameras: {:?}", devices);
+
     let camera_thread = tokio::spawn(async move {
         loop {
             {
@@ -220,15 +244,14 @@ async fn main() -> Result<()> {
                     continue;
                 }
             }
-            let mut camera = Camera::with_backend(
+            let mut camera = Camera::new(
                 video_device_index, // index
                 Some(CameraFormat::new_from(
                     width as u32,
                     height as u32,
                     FrameFormat::MJPEG,
                     framerate,
-                )),
-                CaptureAPIBackend::Video4Linux, // format
+                )), // format
             )
             .unwrap();
             camera.open_stream().unwrap();
@@ -246,7 +269,29 @@ async fn main() -> Result<()> {
     });
 
     let encoder_thread = tokio::spawn(async move {
+        let mut rx_audio = WatchStream::new(recv_audio.clone());
+
         loop {
+            if let Some(data) = rx_audio.next().await {
+                //convert Vec<i16> to Vec<u8>
+                let as_bytes: &[u8] = bytemuck::cast_slice(&data);
+                let vec_of_bytes: Vec<u8> = as_bytes.to_vec();
+
+                let frame = Packet {
+                    data: Some(encode(vec_of_bytes)),
+                    frame_type: None,
+                    epoch_time: None,
+                    encoding: None,
+                    packet_type: PacketType::Audio,
+                };
+                println!("frame: {:?}", frame);
+                let json = serde_json::to_string(&frame).unwrap();
+                send_bytes.send(json).unwrap();
+            }
+            // else {
+            //     println!("Stream ended");
+            //     break;
+            // }
             let fps_tx_copy = fps_tx.clone();
             let mut ctx: Context<u8> = cfg.new_context().unwrap();
             loop {
@@ -274,7 +319,7 @@ async fn main() -> Result<()> {
                         packet_type: PacketType::Video,
                     };
                     let json = serde_json::to_string(&frame).unwrap();
-                    send_cam.send(json).unwrap();
+                    send_bytes.send(json).unwrap();
                     fps_tx_copy.send(since_the_epoch().as_millis()).unwrap();
                     continue;
                 }
@@ -329,7 +374,7 @@ async fn main() -> Result<()> {
                             packet_type: PacketType::Video,
                         };
                         let json = serde_json::to_string(&frame).unwrap();
-                        send_cam.send(json).unwrap();
+                        send_bytes.send(json).unwrap();
                         debug!("time serializing {:?}", time_serializing.elapsed());
                         fps_tx_copy.send(since_the_epoch().as_millis()).unwrap();
                     }
@@ -432,34 +477,8 @@ async fn main() -> Result<()> {
 
     app.at("/ws").get(WebSocket::new(
         move |req: Request<std::sync::Arc<TideState>>, wsc: WebSocketConnection| {
-            let rx = WatchStream::new(recv_cam.clone());
+            let rx = WatchStream::new(recv_bytes.clone());
             let final_clone = sender_clone.clone();
-            let wsc_clone = wsc.clone();
-            let mut rx_audio = WatchStream::new(recv_audio.clone());
-            tokio::spawn(async move {
-                loop {
-                    if let Some(data) = rx_audio.next().await {
-                        let as_bytes: &[u8] = bytemuck::cast_slice(&data);
-                        //convert Vec<i16> to Vec<u8>
-                        let vec_of_bytes: Vec<u8> = as_bytes.to_vec();
-
-                        let frame = Packet {
-                            data: Some(encode(vec_of_bytes)),
-                            frame_type: None,
-                            epoch_time: None,
-                            encoding: None,
-                            packet_type: PacketType::Audio,
-                        };
-                        println!("frame: {:?}", frame);
-                        let json = serde_json::to_string(&frame).unwrap();
-                        wsc_clone.send(Message::text(json)).await.unwrap();
-                    } else {
-                        println!("Stream ended");
-                        break;
-                    }
-                }
-                // receive audio data
-            });
 
             async move {
                 println!("Web socketss {:?}", wsc);
@@ -541,8 +560,9 @@ pub async fn client_connection(
         info!("adding connection, connection counter: {:?}", *counter_ref);
         drop(counter_ref);
     }
+
     while let Some(next) = recv.next().await {
-        debug!("Forwarding video message");
+        debug!("Forwarding message");
         let time_serializing = Instant::now();
         match wsc.send(Message::text(next)).await {
             Ok(_) => {}
@@ -550,10 +570,7 @@ pub async fn client_connection(
                 info!("blocking before removing connection {:?}", counter);
                 let mut counter_ref = counter.lock().unwrap();
                 *counter_ref = *counter_ref - 1;
-                info!(
-                    "Removing connection, connection counter: {:?}",
-                    *counter_ref
-                );
+                info!("Removing connection, connection counter: {:?}", *counter_ref);
                 break;
             }
         }
