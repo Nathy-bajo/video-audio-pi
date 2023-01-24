@@ -1,8 +1,6 @@
 // #[macro_use]
 
 use base64::encode;
-// use color_eyre::eyre::eyre;
-// use color_eyre::eyre::Result;
 use anyhow::Result;
 use image::codecs;
 use image::ImageBuffer;
@@ -206,31 +204,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // let mut rx_audio = WatchStream::new(recv_audio.clone());
-
-    // loop {
-    //     if let Some(data) = rx_audio.next().await {
-    //         //convert Vec<i16> to Vec<u8>
-    //         let as_bytes: &[u8] = bytemuck::cast_slice(&data);
-    //         let vec_of_bytes: Vec<u8> = as_bytes.to_vec();
-
-    //         let frame = Packet {
-    //             data: Some(encode(vec_of_bytes)),
-    //             frame_type: None,
-    //             epoch_time: None,
-    //             encoding: None,
-    //             packet_type: PacketType::Audio,
-    //         };
-    //         println!("frame: {:?}", frame);
-    //         let json = serde_json::to_string(&frame).unwrap();
-    //         // send_bytes.send(json).unwrap();
-    //     } else {
-    //         println!("Stream ended");
-    //         break;
-    //     }
-    // }
-    //     // receive audio data
-
     let devices = nokhwa::query_devices(CaptureAPIBackend::Video4Linux)?;
     info!("available cameras: {:?}", devices);
 
@@ -288,10 +261,6 @@ async fn main() -> Result<()> {
                 let json = serde_json::to_string(&frame).unwrap();
                 send_bytes.send(json).unwrap();
             }
-            // else {
-            //     println!("Stream ended");
-            //     break;
-            // }
             let fps_tx_copy = fps_tx.clone();
             let mut ctx: Context<u8> = cfg.new_context().unwrap();
             loop {
